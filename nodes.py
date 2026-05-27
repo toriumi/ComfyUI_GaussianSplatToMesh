@@ -5,9 +5,18 @@ Uses scipy + trimesh + sklearn (no Open3D dependency) for surface reconstruction
 Compatible with Python 3.13 and ComfyUI v0.22.0.
 
 Supported methods:
+  - marching_cubes: Volumetric marching cubes via scipy/skimage (recommended)
+  - poisson_like: Screened-Poisson-like surface reconstruction
   - alpha_shape: Alpha shape triangulation via scipy Delaunay
   - ball_pivoting: Approximate ball-pivoting via local Delaunay patches
-  - marching_cubes: Volumetric marching cubes via scipy/skimage
+
+v2.0 — Major quality improvements:
+  - Proper vertex color transfer with KNN interpolation
+  - Improved marching cubes with KDE-based density field
+  - Poisson-like surface reconstruction method
+  - Voxel grid downsampling (preserves spatial structure)
+  - Density-based outlier removal
+  - Higher default max_points (200K)
 """
 
 import numpy as np
@@ -23,17 +32,6 @@ SH_C0 = 0.28209479177387814
 def _extract_points_and_colors(ply_data):
     """
     Extract 3D point positions and RGB colors from PLY_DATA dict.
-
-    PLY_DATA structure (from VNCCS_WorldMirrorV2_3D):
-      - pts3d: [B, S, H, W, 3] or None
-      - pts3d_filtered: [N, 3] tensor or None
-      - splats: dict with keys {means, quats, scales, opacities, sh, weights, ...}
-      - images: [B, S, H, W, 3] tensor (input images)
-      - filter_mask: [N] boolean tensor or None
-
-    Returns:
-      points: np.ndarray [N, 3] float64
-      colors: np.ndarray [N, 3] float64 in [0, 1]
     """
     points = None
     colors = None
@@ -43,33 +41,24 @@ def _extract_points_and_colors(ply_data):
     if splats is not None and "means" in splats:
         means = splats["means"]
         if isinstance(means, torch.Tensor):
-            # means shape: [B, N, 3] or [N, 3]
             if means.dim() == 3:
-                means = means[0]  # take first batch
+                means = means[0]
             points = means.detach().cpu().float().numpy()
 
         # Extract colors from SH coefficients
         sh = splats.get("sh")
         if sh is not None and isinstance(sh, torch.Tensor):
             if sh.dim() == 4:
-                sh = sh[0]  # [N, C, 3] or [N, 1, 3]
-            elif sh.dim() == 3:
-                pass  # already [N, C, 3] or [N, SH_degree, 3]
-
-            # Take DC component (degree 0)
+                sh = sh[0]
             if sh.dim() == 3:
-                sh_dc = sh[:, 0, :]  # [N, 3]
+                sh_dc = sh[:, 0, :]
             elif sh.dim() == 2:
-                sh_dc = sh  # [N, 3]
+                sh_dc = sh
             else:
                 sh_dc = sh.reshape(-1, 3)
-
-            # Convert SH DC to RGB: color = sigmoid(sh * C0)
-            # or color = 0.5 + C0 * sh (linear approximation used in save_utils)
             rgb = 0.5 + SH_C0 * sh_dc.detach().cpu().float().numpy()
             colors = np.clip(rgb, 0.0, 1.0)
 
-        # Fallback: use colors key directly if available
         if colors is None:
             raw_colors = splats.get("colors")
             if raw_colors is not None and isinstance(raw_colors, torch.Tensor):
@@ -90,22 +79,19 @@ def _extract_points_and_colors(ply_data):
     if points is None:
         pts3d = ply_data.get("pts3d")
         if pts3d is not None and isinstance(pts3d, torch.Tensor):
-            # Shape: [B, S, H, W, 3]
-            pts = pts3d[0]  # first batch -> [S, H, W, 3]
+            pts = pts3d[0]
             points = pts.detach().cpu().float().numpy().reshape(-1, 3)
 
-            # Try to get colors from images
             images = ply_data.get("images")
             if images is not None and isinstance(images, torch.Tensor):
-                imgs = images[0]  # [S, H, W, 3] or [S, 3, H, W]
+                imgs = images[0]
                 if imgs.shape[-1] != 3 and imgs.shape[1] == 3:
-                    imgs = imgs.permute(0, 2, 3, 1)  # [S, H, W, 3]
+                    imgs = imgs.permute(0, 2, 3, 1)
                 colors = imgs.detach().cpu().float().numpy().reshape(-1, 3)
                 if colors.max() > 1.0:
                     colors = colors / 255.0
                 colors = np.clip(colors, 0.0, 1.0)
 
-            # Apply filter mask if available
             fmask = ply_data.get("filter_mask")
             if fmask is not None and isinstance(fmask, torch.Tensor):
                 mask_np = fmask.detach().cpu().numpy().astype(bool).reshape(-1)
@@ -122,141 +108,173 @@ def _extract_points_and_colors(ply_data):
 
     # Filter out NaN/Inf points
     valid = np.isfinite(points).all(axis=1)
+    if colors is not None and colors.shape[0] == points.shape[0]:
+        colors = colors[valid]
     points = points[valid]
-    if colors is not None:
-        colors = colors[valid] if colors.shape[0] > valid.sum() or colors.shape[0] == valid.shape[0] else colors[:valid.sum()]
 
-    # Ensure colors array matches points
     if colors is None or colors.shape[0] != points.shape[0]:
-        colors = np.ones((points.shape[0], 3), dtype=np.float64) * 0.7  # default gray
+        print("[GaussianSplatToMesh] WARNING: Color data missing or mismatched, using default gray")
+        colors = np.ones((points.shape[0], 3), dtype=np.float64) * 0.7
 
-    print(f"[GaussianSplatToMesh] Extracted {points.shape[0]} points")
+    print(f"[GaussianSplatToMesh] Extracted {points.shape[0]} points, "
+          f"color range: [{colors.min():.3f}, {colors.max():.3f}]")
     return points.astype(np.float64), colors.astype(np.float64)
 
 
-def _estimate_normals(points, k=30):
-    """
-    Estimate point normals using PCA on k-nearest neighbors.
-
-    Args:
-        points: [N, 3] numpy array
-        k: number of neighbors for normal estimation
-
-    Returns:
-        normals: [N, 3] numpy array (unit normals)
-    """
+def _estimate_normals_fast(points, k=20):
+    """Fast vectorized normal estimation using PCA on k-nearest neighbors."""
+    N = points.shape[0]
     tree = cKDTree(points)
-    k = min(k, points.shape[0])
+    k = min(k, N)
     _, indices = tree.query(points, k=k)
 
-    normals = np.zeros_like(points)
-    for i in range(points.shape[0]):
-        neighbors = points[indices[i]]
-        centroid = neighbors.mean(axis=0)
-        cov = (neighbors - centroid).T @ (neighbors - centroid)
-        try:
-            eigenvalues, eigenvectors = np.linalg.eigh(cov)
-            normals[i] = eigenvectors[:, 0]  # smallest eigenvalue = normal direction
-        except np.linalg.LinAlgError:
-            normals[i] = [0, 0, 1]
+    normals = np.zeros((N, 3), dtype=np.float64)
+    batch_size = 10000
+    for start in range(0, N, batch_size):
+        end = min(start + batch_size, N)
+        batch_indices = indices[start:end]
+        neighbors = points[batch_indices]
+        centroids = neighbors.mean(axis=1)
+        centered = neighbors - centroids[:, np.newaxis, :]
+        covs = np.einsum('bki,bkj->bij', centered, centered)
+        for i in range(end - start):
+            try:
+                eigenvalues, eigenvectors = np.linalg.eigh(covs[i])
+                normals[start + i] = eigenvectors[:, 0]
+            except np.linalg.LinAlgError:
+                normals[start + i] = [0, 0, 1]
 
-    # Orient normals consistently (toward centroid)
+    # Orient normals outward
     centroid = points.mean(axis=0)
-    for i in range(normals.shape[0]):
-        if np.dot(normals[i], points[i] - centroid) < 0:
-            normals[i] = -normals[i]
+    directions = points - centroid
+    dot_products = np.sum(normals * directions, axis=1)
+    flip_mask = dot_products < 0
+    normals[flip_mask] = -normals[flip_mask]
 
-    # Normalize
     norms = np.linalg.norm(normals, axis=1, keepdims=True)
     norms = np.maximum(norms, 1e-10)
     normals = normals / norms
-
     return normals
 
 
-def _downsample_points(points, colors, max_points=200000, voxel_size=None):
-    """
-    Downsample point cloud if too large.
+def _downsample_voxel(points, colors, voxel_size):
+    """Voxel grid downsampling — preserves spatial structure."""
+    if np.isscalar(voxel_size):
+        voxel_size_arr = np.array([voxel_size, voxel_size, voxel_size])
+    else:
+        voxel_size_arr = np.asarray(voxel_size)
 
-    Args:
-        points: [N, 3]
-        colors: [N, 3]
-        max_points: maximum number of points
-        voxel_size: if set, use voxel grid downsampling
+    voxel_indices = np.floor(points / voxel_size_arr).astype(np.int64)
+    voxel_centers = (voxel_indices + 0.5) * voxel_size_arr
 
-    Returns:
-        downsampled points and colors
-    """
+    voxel_dict = {}
+    for i in range(points.shape[0]):
+        key = tuple(voxel_indices[i])
+        dist_to_center = np.linalg.norm(points[i] - voxel_centers[i])
+        if key not in voxel_dict or dist_to_center < voxel_dict[key][1]:
+            voxel_dict[key] = (i, dist_to_center)
+
+    selected_indices = np.array([v[0] for v in voxel_dict.values()])
+    selected_indices.sort()
+    return points[selected_indices], colors[selected_indices]
+
+
+def _downsample_points(points, colors, max_points=200000):
+    """Downsample point cloud using voxel grid if too large."""
     if points.shape[0] <= max_points:
         return points, colors
 
-    if voxel_size is not None:
-        # Voxel grid downsampling
-        voxel_indices = np.floor(points / voxel_size).astype(np.int64)
-        _, unique_idx = np.unique(voxel_indices, axis=0, return_index=True)
-        return points[unique_idx], colors[unique_idx]
-    else:
-        # Random downsampling
-        indices = np.random.choice(points.shape[0], max_points, replace=False)
-        indices.sort()
-        return points[indices], colors[indices]
+    bbox_extent = points.max(axis=0) - points.min(axis=0)
+    volume = np.prod(np.maximum(bbox_extent, 1e-6))
+    target_voxel_size = (volume / max_points) ** (1.0 / 3.0)
+
+    ds_points, ds_colors = _downsample_voxel(points, colors, target_voxel_size)
+
+    if ds_points.shape[0] > max_points * 1.2:
+        ratio = (ds_points.shape[0] / max_points) ** (1.0 / 3.0)
+        ds_points, ds_colors = _downsample_voxel(points, colors, target_voxel_size * ratio)
+
+    if ds_points.shape[0] > max_points:
+        idx = np.random.choice(ds_points.shape[0], max_points, replace=False)
+        idx.sort()
+        ds_points, ds_colors = ds_points[idx], ds_colors[idx]
+
+    print(f"[GaussianSplatToMesh] Voxel downsampled: {points.shape[0]} -> {ds_points.shape[0]} points")
+    return ds_points, ds_colors
 
 
 def _remove_outliers(points, colors, nb_neighbors=20, std_ratio=2.0):
-    """
-    Remove statistical outliers from point cloud.
-
-    Args:
-        points: [N, 3]
-        colors: [N, 3]
-        nb_neighbors: number of neighbors for statistics
-        std_ratio: standard deviation multiplier threshold
-
-    Returns:
-        filtered points and colors
-    """
+    """Remove statistical outliers from point cloud."""
     if points.shape[0] < nb_neighbors + 1:
         return points, colors
 
     tree = cKDTree(points)
     k = min(nb_neighbors + 1, points.shape[0])
     distances, _ = tree.query(points, k=k)
-    mean_distances = distances[:, 1:].mean(axis=1)  # exclude self
+    mean_distances = distances[:, 1:].mean(axis=1)
 
     global_mean = mean_distances.mean()
     global_std = mean_distances.std()
     threshold = global_mean + std_ratio * global_std
 
     mask = mean_distances < threshold
-    print(f"[GaussianSplatToMesh] Outlier removal: {points.shape[0]} -> {mask.sum()} points")
+    removed = points.shape[0] - mask.sum()
+    print(f"[GaussianSplatToMesh] Outlier removal: {points.shape[0]} -> {mask.sum()} (removed {removed})")
     return points[mask], colors[mask]
 
 
-def _alpha_shape_mesh(points, colors, alpha=0.0):
-    """
-    Create mesh using Delaunay triangulation with alpha shape filtering.
+def _remove_outliers_density(points, colors, percentile=5):
+    """Remove outliers based on local density."""
+    if points.shape[0] < 50:
+        return points, colors
 
-    Args:
-        points: [N, 3] numpy array
-        colors: [N, 3] numpy array in [0, 1]
-        alpha: alpha value for filtering (0 = convex hull, larger = more detail)
+    tree = cKDTree(points)
+    k = min(10, points.shape[0])
+    distances, _ = tree.query(points, k=k)
+    local_density = 1.0 / (distances[:, 1:].mean(axis=1) + 1e-10)
 
-    Returns:
-        trimesh.Trimesh object
-    """
+    threshold = np.percentile(local_density, percentile)
+    mask = local_density >= threshold
+
+    removed = points.shape[0] - mask.sum()
+    print(f"[GaussianSplatToMesh] Density filter: {points.shape[0]} -> {mask.sum()} (removed {removed})")
+    return points[mask], colors[mask]
+
+
+def _transfer_colors_to_vertices(mesh_vertices, source_points, source_colors, k=5):
+    """Transfer colors from source point cloud to mesh vertices using KNN interpolation."""
+    tree = cKDTree(source_points)
+    k = min(k, source_points.shape[0])
+    distances, indices = tree.query(mesh_vertices, k=k)
+
+    if k == 1:
+        vert_colors = source_colors[indices.ravel()]
+    else:
+        distances = np.maximum(distances, 1e-10)
+        weights = 1.0 / distances
+        weights_sum = weights.sum(axis=1, keepdims=True)
+        weights_normalized = weights / weights_sum
+        neighbor_colors = source_colors[indices]
+        vert_colors = np.sum(neighbor_colors * weights_normalized[:, :, np.newaxis], axis=1)
+
+    vert_colors = np.clip(vert_colors, 0.0, 1.0)
+    vert_colors_uint8 = (vert_colors * 255).astype(np.uint8)
+    vert_colors_rgba = np.hstack([
+        vert_colors_uint8,
+        np.full((vert_colors_uint8.shape[0], 1), 255, dtype=np.uint8)
+    ])
+    return vert_colors_rgba
+
+
+def _alpha_shape_mesh(points, colors, alpha=2.0):
+    """Create mesh using Delaunay triangulation with alpha shape filtering."""
     print(f"[GaussianSplatToMesh] Running alpha shape (alpha={alpha})...")
 
-    # Compute Delaunay triangulation
     tri = Delaunay(points)
-    tetrahedra = tri.simplices  # [M, 4]
+    tetrahedra = tri.simplices
 
-    # Extract surface triangles from tetrahedra
-    # Each tetrahedron has 4 triangular faces
-    faces_set = set()
     face_count = {}
-
     for tet in tetrahedra:
-        # 4 faces of a tetrahedron
         for face in [
             tuple(sorted([tet[0], tet[1], tet[2]])),
             tuple(sorted([tet[0], tet[1], tet[3]])),
@@ -265,18 +283,12 @@ def _alpha_shape_mesh(points, colors, alpha=0.0):
         ]:
             face_count[face] = face_count.get(face, 0) + 1
 
-    # Surface faces appear in exactly one tetrahedron (boundary faces)
-    surface_faces = []
-    for face, count in face_count.items():
-        if count == 1:
-            surface_faces.append(face)
+    surface_faces = [f for f, c in face_count.items() if c == 1]
 
     if alpha > 0:
-        # Filter by circumradius
         filtered_faces = []
         for face in surface_faces:
             pts = points[list(face)]
-            # Compute circumradius of triangle
             a = np.linalg.norm(pts[1] - pts[0])
             b = np.linalg.norm(pts[2] - pts[1])
             c = np.linalg.norm(pts[0] - pts[2])
@@ -292,44 +304,27 @@ def _alpha_shape_mesh(points, colors, alpha=0.0):
         raise ValueError("Alpha shape produced no faces. Try adjusting alpha parameter.")
 
     faces_array = np.array(surface_faces, dtype=np.int64)
-
-    # Create vertex colors (0-255 uint8)
-    vertex_colors_uint8 = (colors * 255).astype(np.uint8)
-    # Add alpha channel
-    vertex_colors_rgba = np.hstack([
-        vertex_colors_uint8,
-        np.full((vertex_colors_uint8.shape[0], 1), 255, dtype=np.uint8)
-    ])
+    vertex_colors_rgba = _transfer_colors_to_vertices(points, points, colors, k=1)
 
     mesh = Trimesh.Trimesh(
         vertices=points,
         faces=faces_array,
         vertex_colors=vertex_colors_rgba,
-        process=True,
+        process=False,
     )
+    mesh.remove_degenerate_faces()
+    mesh.remove_duplicate_faces()
 
-    print(f"[GaussianSplatToMesh] Alpha shape: {len(mesh.vertices)} vertices, {len(mesh.faces)} faces")
+    print(f"[GaussianSplatToMesh] Alpha shape: {len(mesh.vertices)} verts, {len(mesh.faces)} faces")
     return mesh
 
 
-def _marching_cubes_mesh(points, colors, resolution=128, padding=0.1):
-    """
-    Create mesh using marching cubes on a voxelized density field.
-
-    Args:
-        points: [N, 3] numpy array
-        colors: [N, 3] numpy array in [0, 1]
-        resolution: voxel grid resolution
-        padding: padding ratio around point cloud bounds
-
-    Returns:
-        trimesh.Trimesh object
-    """
-    print(f"[GaussianSplatToMesh] Running marching cubes (resolution={resolution})...")
+def _marching_cubes_mesh(points, colors, resolution=256, padding=0.1, sigma=1.5):
+    """Create mesh using marching cubes on a KDE-based density field."""
+    print(f"[GaussianSplatToMesh] Running marching cubes (res={resolution}, sigma={sigma})...")
 
     from scipy.ndimage import gaussian_filter
 
-    # Compute bounding box
     pmin = points.min(axis=0)
     pmax = points.max(axis=0)
     extent = pmax - pmin
@@ -338,92 +333,141 @@ def _marching_cubes_mesh(points, colors, resolution=128, padding=0.1):
     pmax += pad
     extent = pmax - pmin
 
-    # Create voxel grid
     voxel_size = extent / resolution
     grid = np.zeros((resolution, resolution, resolution), dtype=np.float32)
 
-    # Voxelize points (accumulate density)
     indices = ((points - pmin) / voxel_size).astype(np.int32)
     indices = np.clip(indices, 0, resolution - 1)
 
-    for idx in indices:
-        grid[idx[0], idx[1], idx[2]] += 1.0
+    flat_indices = (indices[:, 0] * resolution * resolution +
+                    indices[:, 1] * resolution + indices[:, 2])
+    np.add.at(grid.ravel(), flat_indices, 1.0)
 
-    # Smooth the density field
-    grid = gaussian_filter(grid, sigma=1.5)
+    # Splat to neighbors for smoother density
+    for dx in [-1, 0, 1]:
+        for dy in [-1, 0, 1]:
+            for dz in [-1, 0, 1]:
+                if dx == 0 and dy == 0 and dz == 0:
+                    continue
+                shifted = indices + np.array([dx, dy, dz])
+                shifted = np.clip(shifted, 0, resolution - 1)
+                flat_s = (shifted[:, 0] * resolution * resolution +
+                          shifted[:, 1] * resolution + shifted[:, 2])
+                w = 0.5 ** (abs(dx) + abs(dy) + abs(dz))
+                np.add.at(grid.ravel(), flat_s, w)
 
-    # Determine iso-level
+    grid = gaussian_filter(grid, sigma=sigma)
+
     nonzero = grid[grid > 0]
     if len(nonzero) == 0:
         raise ValueError("No points in voxel grid")
-    iso_level = np.percentile(nonzero, 20)
 
-    # Marching cubes
+    iso_level = np.percentile(nonzero, 30)
+    print(f"[GaussianSplatToMesh] Density: min={grid.min():.3f}, max={grid.max():.3f}, iso={iso_level:.3f}")
+
     try:
         from skimage.measure import marching_cubes
         verts, faces, normals_mc, _ = marching_cubes(grid, level=iso_level)
     except ImportError:
-        # Fallback: use scipy if skimage not available
-        raise ImportError(
-            "scikit-image is required for marching_cubes method. "
-            "Please install it: pip install scikit-image"
-        )
+        raise ImportError("scikit-image required for marching_cubes. pip install scikit-image")
 
-    # Transform vertices back to world coordinates
     verts = verts * voxel_size + pmin
-
-    # Transfer colors from nearest points
-    tree = cKDTree(points)
-    _, nearest_idx = tree.query(verts, k=1)
-    vert_colors = colors[nearest_idx]
-    vert_colors_uint8 = (vert_colors * 255).astype(np.uint8)
-    vert_colors_rgba = np.hstack([
-        vert_colors_uint8,
-        np.full((vert_colors_uint8.shape[0], 1), 255, dtype=np.uint8)
-    ])
+    vertex_colors_rgba = _transfer_colors_to_vertices(verts, points, colors, k=5)
 
     mesh = Trimesh.Trimesh(
-        vertices=verts,
-        faces=faces,
-        vertex_colors=vert_colors_rgba,
-        process=True,
+        vertices=verts, faces=faces,
+        vertex_colors=vertex_colors_rgba, process=False,
     )
+    mesh.remove_degenerate_faces()
+    mesh.remove_duplicate_faces()
 
-    print(f"[GaussianSplatToMesh] Marching cubes: {len(mesh.vertices)} vertices, {len(mesh.faces)} faces")
+    print(f"[GaussianSplatToMesh] Marching cubes: {len(mesh.vertices)} verts, {len(mesh.faces)} faces")
+    return mesh
+
+
+def _poisson_like_mesh(points, colors, depth=8, scale=1.1):
+    """Screened-Poisson-like surface reconstruction without Open3D."""
+    resolution = min(2 ** depth, 256)
+    print(f"[GaussianSplatToMesh] Running Poisson-like (depth={depth}, res={resolution})...")
+
+    from scipy.ndimage import gaussian_filter
+
+    print("[GaussianSplatToMesh] Estimating normals...")
+    normals = _estimate_normals_fast(points, k=min(20, points.shape[0]))
+
+    pmin = points.min(axis=0)
+    pmax = points.max(axis=0)
+    center = (pmin + pmax) / 2
+    extent = (pmax - pmin) * scale
+    pmin = center - extent / 2
+    pmax = center + extent / 2
+    voxel_size = extent / resolution
+
+    grid = np.zeros((resolution, resolution, resolution), dtype=np.float32)
+    weight_grid = np.zeros_like(grid)
+
+    voxel_coords = ((points - pmin) / voxel_size).astype(np.int32)
+    voxel_coords = np.clip(voxel_coords, 0, resolution - 1)
+
+    splat_range = 2
+    bandwidth = np.mean(voxel_size) * 2.0
+    for i in range(points.shape[0]):
+        ix, iy, iz = voxel_coords[i]
+        for dx in range(-splat_range, splat_range + 1):
+            for dy in range(-splat_range, splat_range + 1):
+                for dz in range(-splat_range, splat_range + 1):
+                    nx, ny, nz = ix + dx, iy + dy, iz + dz
+                    if 0 <= nx < resolution and 0 <= ny < resolution and 0 <= nz < resolution:
+                        vc = pmin + (np.array([nx, ny, nz]) + 0.5) * voxel_size
+                        diff = vc - points[i]
+                        signed_dist = np.dot(diff, normals[i])
+                        dist_sq = np.sum(diff ** 2)
+                        dist_weight = np.exp(-dist_sq / (2 * bandwidth ** 2))
+                        grid[nx, ny, nz] += signed_dist * dist_weight
+                        weight_grid[nx, ny, nz] += dist_weight
+
+    valid_mask = weight_grid > 0
+    grid[valid_mask] /= weight_grid[valid_mask]
+    grid = gaussian_filter(grid, sigma=1.0)
+
+    try:
+        from skimage.measure import marching_cubes
+        verts, faces, normals_mc, _ = marching_cubes(grid, level=0.0)
+    except ImportError:
+        raise ImportError("scikit-image required for poisson_like. pip install scikit-image")
+
+    verts = verts * voxel_size + pmin
+    vertex_colors_rgba = _transfer_colors_to_vertices(verts, points, colors, k=5)
+
+    mesh = Trimesh.Trimesh(
+        vertices=verts, faces=faces,
+        vertex_colors=vertex_colors_rgba, process=False,
+    )
+    mesh.remove_degenerate_faces()
+    mesh.remove_duplicate_faces()
+
+    print(f"[GaussianSplatToMesh] Poisson-like: {len(mesh.vertices)} verts, {len(mesh.faces)} faces")
     return mesh
 
 
 def _ball_pivoting_mesh(points, colors, radius_factor=1.5):
-    """
-    Approximate ball-pivoting using local Delaunay triangulation patches.
+    """Approximate ball-pivoting using Delaunay with multi-scale edge filtering."""
+    print(f"[GaussianSplatToMesh] Running ball pivoting (radius_factor={radius_factor})...")
 
-    This is a simplified version that creates a mesh by:
-    1. Computing local Delaunay triangulations in overlapping patches
-    2. Filtering triangles by edge length (simulating ball radius)
-    3. Merging patches
-
-    Args:
-        points: [N, 3] numpy array
-        colors: [N, 3] numpy array in [0, 1]
-        radius_factor: multiplier for average nearest-neighbor distance to set max edge length
-
-    Returns:
-        trimesh.Trimesh object
-    """
-    print(f"[GaussianSplatToMesh] Running ball pivoting approximation (radius_factor={radius_factor})...")
-
-    # Compute average nearest-neighbor distance for radius estimation
     tree = cKDTree(points)
     k = min(6, points.shape[0])
     distances, _ = tree.query(points, k=k)
     avg_nn_dist = distances[:, 1:].mean()
-    max_edge_length = avg_nn_dist * radius_factor * 3
 
-    # Use Delaunay triangulation
+    radii = [
+        avg_nn_dist * radius_factor * 2,
+        avg_nn_dist * radius_factor * 3,
+        avg_nn_dist * radius_factor * 5,
+    ]
+
     tri = Delaunay(points)
     tetrahedra = tri.simplices
 
-    # Extract all triangular faces
     face_count = {}
     for tet in tetrahedra:
         for face in [
@@ -434,38 +478,34 @@ def _ball_pivoting_mesh(points, colors, radius_factor=1.5):
         ]:
             face_count[face] = face_count.get(face, 0) + 1
 
-    # Keep boundary faces (appear once) and filter by edge length
-    surface_faces = []
-    for face, count in face_count.items():
-        if count == 1:
-            pts = points[list(face)]
-            edges = [
-                np.linalg.norm(pts[1] - pts[0]),
-                np.linalg.norm(pts[2] - pts[1]),
-                np.linalg.norm(pts[0] - pts[2]),
-            ]
-            if max(edges) < max_edge_length:
-                surface_faces.append(face)
+    # Multi-scale: try each radius and collect faces
+    all_faces = set()
+    for max_edge_length in radii:
+        for face, count in face_count.items():
+            if count == 1 and face not in all_faces:
+                pts = points[list(face)]
+                edges = [
+                    np.linalg.norm(pts[1] - pts[0]),
+                    np.linalg.norm(pts[2] - pts[1]),
+                    np.linalg.norm(pts[0] - pts[2]),
+                ]
+                if max(edges) < max_edge_length:
+                    all_faces.add(face)
 
-    if len(surface_faces) == 0:
+    if len(all_faces) == 0:
         raise ValueError("Ball pivoting produced no faces. Try adjusting radius_factor.")
 
-    faces_array = np.array(surface_faces, dtype=np.int64)
-
-    vertex_colors_uint8 = (colors * 255).astype(np.uint8)
-    vertex_colors_rgba = np.hstack([
-        vertex_colors_uint8,
-        np.full((vertex_colors_uint8.shape[0], 1), 255, dtype=np.uint8)
-    ])
+    faces_array = np.array(list(all_faces), dtype=np.int64)
+    vertex_colors_rgba = _transfer_colors_to_vertices(points, points, colors, k=1)
 
     mesh = Trimesh.Trimesh(
-        vertices=points,
-        faces=faces_array,
-        vertex_colors=vertex_colors_rgba,
-        process=True,
+        vertices=points, faces=faces_array,
+        vertex_colors=vertex_colors_rgba, process=False,
     )
+    mesh.remove_degenerate_faces()
+    mesh.remove_duplicate_faces()
 
-    print(f"[GaussianSplatToMesh] Ball pivoting: {len(mesh.vertices)} vertices, {len(mesh.faces)} faces")
+    print(f"[GaussianSplatToMesh] Ball pivoting: {len(mesh.vertices)} verts, {len(mesh.faces)} faces")
     return mesh
 
 
@@ -475,10 +515,6 @@ def _ball_pivoting_mesh(points, colors, radius_factor=1.5):
 class GaussianSplatToMesh:
     """
     Convert PLY_DATA (Gaussian Splat point cloud from HY-World 2.0) to TRIMESH.
-
-    Extracts 3D points and colors from the Gaussian Splat data, performs
-    surface reconstruction, and outputs a trimesh.Trimesh object compatible
-    with Hy3DExportMesh for GLB/OBJ/PLY/STL export.
     """
 
     @classmethod
@@ -488,46 +524,43 @@ class GaussianSplatToMesh:
                 "ply_data": ("PLY_DATA",),
             },
             "optional": {
-                "method": (["alpha_shape", "ball_pivoting", "marching_cubes"], {
-                    "default": "alpha_shape",
+                "method": (["marching_cubes", "poisson_like", "alpha_shape", "ball_pivoting"], {
+                    "default": "marching_cubes",
                     "tooltip": (
                         "Surface reconstruction method:\n"
-                        "- alpha_shape: Delaunay-based alpha shape (fast, good for dense clouds)\n"
-                        "- ball_pivoting: Approximate ball pivoting (good edge filtering)\n"
-                        "- marching_cubes: Volumetric reconstruction (smooth, requires scikit-image)"
+                        "- marching_cubes: Volumetric reconstruction (recommended, smooth)\n"
+                        "- poisson_like: Normal-based surface reconstruction (best quality, slower)\n"
+                        "- alpha_shape: Delaunay-based alpha shape (fast)\n"
+                        "- ball_pivoting: Approximate ball pivoting (good edge filtering)"
                     ),
                 }),
                 "alpha": ("FLOAT", {
-                    "default": 0.0,
+                    "default": 2.0,
                     "min": 0.0,
                     "max": 100.0,
                     "step": 0.1,
-                    "tooltip": (
-                        "Alpha parameter for alpha_shape method. "
-                        "0 = convex hull, larger values = more detail/holes. "
-                        "Typical range: 0.5-10.0"
-                    ),
+                    "tooltip": "Alpha for alpha_shape (0=convex hull, larger=more detail). Typical: 1.0-5.0",
                 }),
                 "resolution": ("INT", {
-                    "default": 128,
-                    "min": 32,
+                    "default": 256,
+                    "min": 64,
                     "max": 512,
                     "step": 16,
-                    "tooltip": "Voxel grid resolution for marching_cubes method",
+                    "tooltip": "Voxel grid resolution for marching_cubes/poisson_like",
                 }),
                 "radius_factor": ("FLOAT", {
-                    "default": 1.5,
+                    "default": 2.0,
                     "min": 0.5,
                     "max": 10.0,
                     "step": 0.1,
                     "tooltip": "Radius multiplier for ball_pivoting method",
                 }),
                 "max_points": ("INT", {
-                    "default": 100000,
+                    "default": 200000,
                     "min": 10000,
-                    "max": 500000,
+                    "max": 1000000,
                     "step": 10000,
-                    "tooltip": "Maximum number of points (downsampled if exceeded)",
+                    "tooltip": "Maximum number of points (voxel-downsampled if exceeded)",
                 }),
                 "remove_outliers": ("BOOLEAN", {
                     "default": True,
@@ -538,7 +571,32 @@ class GaussianSplatToMesh:
                     "min": 0.5,
                     "max": 5.0,
                     "step": 0.1,
-                    "tooltip": "Standard deviation ratio for outlier removal (lower = more aggressive)",
+                    "tooltip": "Std dev ratio for outlier removal (lower = more aggressive)",
+                }),
+                "density_filter": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Remove sparse/isolated points based on local density",
+                }),
+                "density_percentile": ("FLOAT", {
+                    "default": 5.0,
+                    "min": 0.0,
+                    "max": 30.0,
+                    "step": 1.0,
+                    "tooltip": "Percentile threshold for density filter (higher = more aggressive)",
+                }),
+                "color_knn": ("INT", {
+                    "default": 5,
+                    "min": 1,
+                    "max": 20,
+                    "step": 1,
+                    "tooltip": "Number of nearest neighbors for vertex color interpolation",
+                }),
+                "smooth_sigma": ("FLOAT", {
+                    "default": 1.5,
+                    "min": 0.5,
+                    "max": 5.0,
+                    "step": 0.1,
+                    "tooltip": "Gaussian smoothing sigma for marching_cubes density field",
                 }),
             },
         }
@@ -549,19 +607,24 @@ class GaussianSplatToMesh:
     CATEGORY = "3D/mesh"
     DESCRIPTION = (
         "Convert PLY_DATA (Gaussian Splat point cloud from HY-World 2.0) to TRIMESH mesh. "
-        "The output can be connected to Hy3DExportMesh for GLB/OBJ/PLY/STL export."
+        "The output can be connected to Hy3DExportMesh for GLB/OBJ/PLY/STL export. "
+        "v2.0: Improved color transfer, marching cubes default, Poisson-like method."
     )
 
     def convert(
         self,
         ply_data,
-        method="alpha_shape",
-        alpha=0.0,
-        resolution=128,
-        radius_factor=1.5,
-        max_points=100000,
+        method="marching_cubes",
+        alpha=2.0,
+        resolution=256,
+        radius_factor=2.0,
+        max_points=200000,
         remove_outliers=True,
         outlier_std_ratio=2.0,
+        density_filter=True,
+        density_percentile=5.0,
+        color_knn=5,
+        smooth_sigma=1.5,
     ):
         print(f"[GaussianSplatToMesh] Starting conversion (method={method})...")
 
@@ -574,32 +637,65 @@ class GaussianSplatToMesh:
                 "Need at least 4 points."
             )
 
-        # ── 2. Remove outliers ────────────────────────────────────────────
+        # ── 2. Remove outliers (statistical) ──────────────────────────────
         if remove_outliers and points.shape[0] > 50:
-            points, colors = _remove_outliers(
-                points, colors,
+            points, colors = _remove_outliers(                points, colors,
                 nb_neighbors=min(20, points.shape[0] - 1),
                 std_ratio=outlier_std_ratio,
             )
 
-        # ── 3. Downsample if needed ───────────────────────────────────────
+        # ── 3. Remove outliers (density-based) ───────────────────────────
+        if density_filter and points.shape[0] > 100:
+            points, colors = _remove_outliers_density(
+                points, colors, percentile=density_percentile,
+            )
+
+        # ── 4. Downsample if needed (voxel grid) ─────────────────────────
         if points.shape[0] > max_points:
             print(f"[GaussianSplatToMesh] Downsampling: {points.shape[0]} -> {max_points}")
             points, colors = _downsample_points(points, colors, max_points=max_points)
 
-        # ── 4. Surface reconstruction ─────────────────────────────────────
-        if method == "alpha_shape":
+        print(f"[GaussianSplatToMesh] Final point cloud: {points.shape[0]} points")
+
+        # ── 5. Surface reconstruction ─────────────────────────────────────
+        if method == "marching_cubes":
+            mesh = _marching_cubes_mesh(
+                points, colors, resolution=resolution, sigma=smooth_sigma,
+            )
+        elif method == "poisson_like":
+            # Compute depth from resolution
+            depth = max(6, min(8, int(np.log2(resolution))))
+            mesh = _poisson_like_mesh(points, colors, depth=depth)
+        elif method == "alpha_shape":
             mesh = _alpha_shape_mesh(points, colors, alpha=alpha)
         elif method == "ball_pivoting":
             mesh = _ball_pivoting_mesh(points, colors, radius_factor=radius_factor)
-        elif method == "marching_cubes":
-            mesh = _marching_cubes_mesh(points, colors, resolution=resolution)
         else:
             raise ValueError(f"Unknown method: {method}")
 
+        # ── 6. Verify vertex colors are present ──────────────────────────
+        if mesh.visual is None or not hasattr(mesh.visual, 'vertex_colors'):
+            print("[GaussianSplatToMesh] WARNING: Re-applying vertex colors...")
+            vertex_colors_rgba = _transfer_colors_to_vertices(
+                np.array(mesh.vertices), points, colors, k=color_knn,
+            )
+            mesh.visual = Trimesh.visual.ColorVisuals(
+                mesh=mesh, vertex_colors=vertex_colors_rgba,
+            )
+        else:
+            vc = mesh.visual.vertex_colors
+            if vc is None or len(vc) == 0:
+                print("[GaussianSplatToMesh] WARNING: Empty vertex colors, re-applying...")
+                vertex_colors_rgba = _transfer_colors_to_vertices(
+                    np.array(mesh.vertices), points, colors, k=color_knn,
+                )
+                mesh.visual = Trimesh.visual.ColorVisuals(
+                    mesh=mesh, vertex_colors=vertex_colors_rgba,
+                )
+
         print(
             f"[GaussianSplatToMesh] Done: {len(mesh.vertices)} vertices, "
-            f"{len(mesh.faces)} faces"
+            f"{len(mesh.faces)} faces, has_colors={mesh.visual.vertex_colors is not None}"
         )
 
         return (mesh,)
