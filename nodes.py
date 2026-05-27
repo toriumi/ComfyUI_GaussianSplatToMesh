@@ -17,6 +17,12 @@ v2.0 — Major quality improvements:
   - Voxel grid downsampling (preserves spatial structure)
   - Density-based outlier removal
   - Higher default max_points (200K)
+
+v2.1 — Color extraction fix:
+  - Fixed bug where Strategy 2 (pts3d_filtered) left colors as None
+  - Added multiple color source fallbacks: images, features_dc, sh_coeffs/shs_0
+  - Proper filter_mask application for color data
+  - Added mesh normal computation after surface reconstruction
 """
 
 import numpy as np
@@ -74,6 +80,77 @@ def _extract_points_and_colors(ply_data):
         pts_filtered = ply_data.get("pts3d_filtered")
         if pts_filtered is not None and isinstance(pts_filtered, torch.Tensor):
             points = pts_filtered.detach().cpu().float().numpy().reshape(-1, 3)
+            print(f"[GaussianSplatToMesh] Strategy 2: pts3d_filtered -> {points.shape[0]} points")
+
+    # ── Strategy 2.5: Color recovery when points found but colors missing ─
+    # This handles the case where Strategy 2 found points via pts3d_filtered
+    # but colors were not extracted (the original bug).
+    if points is not None and colors is None:
+        # Color source 1: images key
+        images = ply_data.get("images")
+        if images is not None and isinstance(images, torch.Tensor):
+            imgs = images[0] if images.dim() == 5 else images
+            if imgs.dim() == 4 and imgs.shape[1] == 3:  # [B, 3, H, W]
+                imgs = imgs.permute(0, 2, 3, 1)  # -> [B, H, W, 3]
+            all_colors = imgs.detach().cpu().float().numpy().reshape(-1, 3)
+            if all_colors.max() > 1.0:
+                all_colors = all_colors / 255.0
+
+            # Apply filter_mask if available
+            fmask = ply_data.get("filter_mask")
+            if fmask is not None and isinstance(fmask, torch.Tensor):
+                mask_np = fmask.detach().cpu().numpy().astype(bool).reshape(-1)
+                if mask_np.shape[0] == all_colors.shape[0]:
+                    all_colors = all_colors[mask_np]
+
+            if all_colors.shape[0] == points.shape[0]:
+                colors = np.clip(all_colors, 0.0, 1.0)
+                print(f"[GaussianSplatToMesh] Colors from images: {colors.shape}, "
+                      f"range [{colors.min():.3f}, {colors.max():.3f}]")
+
+        # Color source 2: features_dc (SH degree-0 coefficients)
+        if colors is None:
+            features_dc = ply_data.get("features_dc")
+            if features_dc is not None and isinstance(features_dc, torch.Tensor):
+                sh0 = features_dc.detach().cpu().float().numpy()
+                if sh0.ndim == 3:  # [N, 1, 3]
+                    sh0 = sh0.squeeze(1)
+                if sh0.ndim == 2 and sh0.shape[1] >= 3:
+                    rgb = sh0[:, :3] * SH_C0 + 0.5
+
+                    # Apply filter_mask if available
+                    fmask = ply_data.get("filter_mask")
+                    if fmask is not None and isinstance(fmask, torch.Tensor):
+                        mask_np = fmask.detach().cpu().numpy().astype(bool).reshape(-1)
+                        if mask_np.shape[0] == rgb.shape[0]:
+                            rgb = rgb[mask_np]
+
+                    if rgb.shape[0] == points.shape[0]:
+                        colors = np.clip(rgb, 0.0, 1.0)
+                        print(f"[GaussianSplatToMesh] Colors from features_dc (SH0): {colors.shape}, "
+                              f"range [{colors.min():.3f}, {colors.max():.3f}]")
+
+        # Color source 3: sh_coeffs or shs_0 (alternative SH keys)
+        if colors is None:
+            for key in ["sh_coeffs", "shs_0"]:
+                sh_data = ply_data.get(key)
+                if sh_data is not None and isinstance(sh_data, torch.Tensor):
+                    sh_np = sh_data.detach().cpu().float().numpy()
+                    if sh_np.ndim == 3:
+                        sh_np = sh_np.squeeze(1)
+                    if sh_np.ndim == 2 and sh_np.shape[1] >= 3:
+                        rgb = sh_np[:, :3] * SH_C0 + 0.5
+
+                        fmask = ply_data.get("filter_mask")
+                        if fmask is not None and isinstance(fmask, torch.Tensor):
+                            mask_np = fmask.detach().cpu().numpy().astype(bool).reshape(-1)
+                            if mask_np.shape[0] == rgb.shape[0]:
+                                rgb = rgb[mask_np]
+
+                        if rgb.shape[0] == points.shape[0]:
+                            colors = np.clip(rgb, 0.0, 1.0)
+                            print(f"[GaussianSplatToMesh] Colors from {key} (SH0): {colors.shape}")
+                            break
 
     # ── Strategy 3: Use pts3d (full point map) ────────────────────────────
     if points is None:
@@ -105,6 +182,19 @@ def _extract_points_and_colors(ply_data):
             "PLY_DATA does not contain valid point data. "
             "Expected keys: 'splats.means', 'pts3d_filtered', or 'pts3d'"
         )
+
+    # Log available keys for debugging when colors are missing
+    if colors is None:
+        available_keys = [k for k in ply_data.keys() if ply_data[k] is not None]
+        print(f"[GaussianSplatToMesh] DEBUG: Available PLY_DATA keys: {available_keys}")
+        for k in available_keys:
+            v = ply_data[k]
+            if isinstance(v, torch.Tensor):
+                print(f"[GaussianSplatToMesh] DEBUG:   {k}: Tensor shape={v.shape}, dtype={v.dtype}")
+            elif isinstance(v, dict):
+                print(f"[GaussianSplatToMesh] DEBUG:   {k}: dict with keys={list(v.keys())}")
+            else:
+                print(f"[GaussianSplatToMesh] DEBUG:   {k}: {type(v).__name__}")
 
     # Filter out NaN/Inf points
     valid = np.isfinite(points).all(axis=1)
@@ -608,7 +698,7 @@ class GaussianSplatToMesh:
     DESCRIPTION = (
         "Convert PLY_DATA (Gaussian Splat point cloud from HY-World 2.0) to TRIMESH mesh. "
         "The output can be connected to Hy3DExportMesh for GLB/OBJ/PLY/STL export. "
-        "v2.0: Improved color transfer, marching cubes default, Poisson-like method."
+        "v2.1: Fixed color extraction for pts3d_filtered, added normal computation."
     )
 
     def convert(
@@ -639,7 +729,8 @@ class GaussianSplatToMesh:
 
         # ── 2. Remove outliers (statistical) ──────────────────────────────
         if remove_outliers and points.shape[0] > 50:
-            points, colors = _remove_outliers(                points, colors,
+            points, colors = _remove_outliers(
+                points, colors,
                 nb_neighbors=min(20, points.shape[0] - 1),
                 std_ratio=outlier_std_ratio,
             )
@@ -673,7 +764,18 @@ class GaussianSplatToMesh:
         else:
             raise ValueError(f"Unknown method: {method}")
 
-        # ── 6. Verify vertex colors are present ──────────────────────────
+        # ── 6. Fix normals ────────────────────────────────────────────────
+        try:
+            if not hasattr(mesh, 'vertex_normals') or mesh.vertex_normals is None or len(mesh.vertex_normals) == 0:
+                mesh.fix_normals()
+                print("[GaussianSplatToMesh] Computed mesh normals via fix_normals()")
+            else:
+                # Ensure normals are consistent
+                mesh.fix_normals()
+        except Exception as e:
+            print(f"[GaussianSplatToMesh] WARNING: Could not fix normals: {e}")
+
+        # ── 7. Verify vertex colors are present ──────────────────────────
         if mesh.visual is None or not hasattr(mesh.visual, 'vertex_colors'):
             print("[GaussianSplatToMesh] WARNING: Re-applying vertex colors...")
             vertex_colors_rgba = _transfer_colors_to_vertices(
